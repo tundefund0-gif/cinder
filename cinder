@@ -319,12 +319,14 @@ def launch_browser(url, sid, browser="auto", use_tmux=False):
     cmd = [browser]
 
     if browser in ("links2", "links"):
+        cfg_file = s.config_dir / "links2.cfg"
+        cfg_file.write_text("set javascript = 1\nset terminal_autodownload = 1\n")
         if mode in ("x11", "wayland", "fb"):
             cmd.append("-g")
             print(f"  {C('🖥')} Display: {G(mode)} (graphical)")
         else:
             print(f"  {C('🖥')} Display: {Y('text')} (256 colors)")
-            cmd.extend(["-force-html", "-enable-javascript"])
+            cmd.append("-force-html")
         cmd.extend(["-cookie-jar", str(s.cookie_path)])
         cmd.extend(["-download-dir", str(s.download_dir)])
     elif browser == "w3m":
