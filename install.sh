@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/usr/bin/env bash
 set -e
 
 echo "  CINDER — Sandboxed Terminal Browser"
@@ -17,7 +17,6 @@ else
     exit 1
 fi
 
-# Install deps
 echo "  Installing dependencies via $PM..."
 if [ "$PM" = "pkg" ]; then
     $PM update -y 2>/dev/null || true
