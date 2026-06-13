@@ -97,7 +97,6 @@ class Session:
         self.history_path = self.path / "history.txt"
         self.bookmark_path = self.path / "bookmarks.txt"
         self.download_dir = self.path / "downloads"
-        self.config_dir = self.path / ".links2"
 
     def exists(self):
         return self.path.is_dir()
@@ -105,10 +104,10 @@ class Session:
     def create(self, url="", name=""):
         self.path.mkdir(parents=True, exist_ok=True)
         self.download_dir.mkdir(exist_ok=True)
-        self.config_dir.mkdir(exist_ok=True)
+        (self.path / ".links").mkdir(exist_ok=True)
         for p in (self.cookie_path, self.history_path, self.bookmark_path):
             p.touch()
-        (self.config_dir / "links2.cfg").touch()
+        (self.path / ".links" / "links.cfg").touch()
         self._write_meta({
             "id": self.id,
             "name": name or self.id[:8],
@@ -319,16 +318,18 @@ def launch_browser(url, sid, browser="auto", use_tmux=False):
     cmd = [browser]
 
     if browser in ("links2", "links"):
-        cfg_file = s.config_dir / "links2.cfg"
-        cfg_file.write_text("set javascript = 1\nset terminal_autodownload = 1\n")
+        cfg_dir = s.path / ".links"
+        cfg_dir.mkdir(exist_ok=True)
+        cfg_file = cfg_dir / "links.cfg"
+        cfg_file.write_text(
+            "set javascript = 1\n"
+            f"set download_directory = {s.download_dir}\n"
+        )
         if mode in ("x11", "wayland", "fb"):
             cmd.append("-g")
             print(f"  {C('🖥')} Display: {G(mode)} (graphical)")
         else:
             print(f"  {C('🖥')} Display: {Y('text')} (256 colors)")
-            cmd.append("-force-html")
-        cmd.extend(["-cookie-jar", str(s.cookie_path)])
-        cmd.extend(["-download-dir", str(s.download_dir)])
     elif browser == "w3m":
         cmd.extend(["-cookie", "-cookie_file", str(s.cookie_path)])
         env["W3M_HOME"] = str(s.path)
