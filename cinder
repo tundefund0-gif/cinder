@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+"""
+cinder — Sandboxed terminal browser for Termux (ARMv7+).
+Isolated browsing sessions with image support via links2 + chafa.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
+
+CINDER_DIR = Path.home() / ".cinder"
+SESSIONS_DIR = CINDER_DIR / "sessions"
+CONFIG_PATH = CINDER_DIR / "config.json"
+
+DEFAULT_CONFIG = {
+    "default_browser": "auto",
+    "image_viewer": "auto",
+    "max_sessions": 30,
+    "cleanup_days": 14,
+    "save_history": True,
+    "use_tmux": False,
+}
+
+
+def load_config():
+    cfg = DEFAULT_CONFIG.copy()
+    if CONFIG_PATH.exists():
+        try:
+            cfg.update(json.loads(CONFIG_PATH.read_text()))
+        except Exception:
+            pass
+    return cfg
+
+
+def save_config(cfg):
+    CINDER_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+def ensure_dirs():
+    CINDER_DIR.mkdir(parents=True, exist_ok=True)
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    if not CONFIG_PATH.exists():
+        save_config(DEFAULT_CONFIG)
+
+
+class Session:
+    def __init__(self, sid):
+        self.id = sid
+        self.path = SESSIONS_DIR / sid
+        self.meta_path = self.path / "meta.json"
+        self.cookie_path = self.path / "cookies.txt"
+        self.history_path = self.path / "history.txt"
+        self.bookmark_path = self.path / "bookmarks.txt"
+        self.download_dir = self.path / "downloads"
+        self.config_dir = self.path / ".links2"
+
+    def exists(self):
+        return self.path.is_dir()
+
+    def create(self, url="", name=""):
+        self.path.mkdir(parents=True, exist_ok=True)
+        self.download_dir.mkdir(exist_ok=True)
+        self.config_dir.mkdir(exist_ok=True)
+        for p in (self.cookie_path, self.history_path, self.bookmark_path):
+            p.touch()
+        self._write_meta({
+            "id": self.id,
+            "name": name or self.id[:8],
+            "created": time.time(),
+            "updated": time.time(),
+            "url": url or "",
+            "browser": "links2",
+        })
+
+    def _write_meta(self, m):
+        self.meta_path.write_text(json.dumps(m, indent=2))
+
+    def meta(self):
+        return json.loads(self.meta_path.read_text())
+
+    def update(self, **kw):
+        m = self.meta()
+        m.update(kw)
+        m["updated"] = time.time()
+        self._write_meta(m)
+
+    def add_history(self, url, title=""):
+        if url:
+            self.history_path.write_text(
+                self.history_path.read_text() + f"{int(time.time())}|{url}|{title}\n"
+            )
+
+    def history(self, limit=50):
+        if not self.history_path.exists():
+            return []
+        lines = self.history_path.read_text().strip().split("\n")
+        result = []
+        for line in lines[-limit:]:
+            parts = line.split("|", 2)
+            if len(parts) >= 2:
+                result.append({"time": int(parts[0]), "url": parts[1], "title": parts[2] if len(parts) > 2 else ""})
+        return result
+
+    def bookmarks(self):
+        if not self.bookmark_path.exists():
+            return []
+        result = []
+        for line in self.bookmark_path.read_text().strip().split("\n"):
+            if "|" in line:
+                url, title = line.split("|", 1)
+                result.append({"url": url, "title": title})
+        return result
+
+    def delete(self):
+        shutil.rmtree(self.path, ignore_errors=True)
+
+
+def detect_browsers():
+    return [b for b in ("links2", "links", "w3m", "lynx", "elinks") if shutil.which(b)]
+
+
+def detect_display_mode():
+    if os.environ.get("DISPLAY"):
+        return "x11"
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    if os.path.exists("/dev/fb0"):
+        return "fb"
+    term = os.environ.get("TERM", "")
+    if "sixel" in term.lower():
+        return "sixel"
+    if "kitty" in term.lower():
+        return "kitty"
+    return "text"
+
+
+def detect_image_viewer():
+    for name in ("chafa", "catimg", "jp2a"):
+        if shutil.which(name):
+            return name
+    if shutil.which("termux-open"):
+        return "termux-open"
+    if shutil.which("xdg-open"):
+        return "xdg-open"
+    return ""
+
+
+def view_image(path, viewer=""):
+    if not os.path.isfile(path):
+        print(f"File not found: {path}")
+        return False
+    viewer = viewer or detect_image_viewer()
+    if not viewer:
+        print("No image viewer. Install: chafa, catimg, or jp2a")
+        return False
+    try:
+        cmds = {
+            "chafa": ["chafa", "--symbols=block", "--colors=256", "--scale=max", path],
+            "catimg": ["catimg", "-w", "120", path],
+            "jp2a": ["jp2a", "--colors", "--width=120", path],
+        }
+        if viewer in cmds:
+            subprocess.run(cmds[viewer])
+        else:
+            subprocess.run([viewer, path])
+        return True
+    except FileNotFoundError:
+        print(f"Viewer '{viewer}' not found")
+        return False
+
+
+def view_image_url(url, viewer=""):
+    suffix = os.path.splitext(urlparse(url).path)[1] or ".img"
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    try:
+        import urllib.request
+        print(f"Downloading {url}...")
+        urllib.request.urlretrieve(url, tmp.name)
+        ok = view_image(tmp.name, viewer)
+        tmp.close()
+        return ok
+    except Exception as e:
+        print(f"Failed: {e}")
+        return False
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+def captcha_view(sid, viewer=""):
+    s = Session(sid)
+    if not s.exists():
+        print(f"Session '{sid}' not found")
+        return
+    images = sorted(s.download_dir.glob("*.*"), key=os.path.getmtime, reverse=True)
+    images = [f for f in images if f.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")]
+    if not images:
+        print("No images in session downloads")
+        return
+    print(f"{'#':<4} {'Name':<40} {'Size':<10} {'Modified':<20}")
+    print("-" * 74)
+    for i, img in enumerate(images[:10], 1):
+        kb = img.stat().st_size // 1024
+        size = f"{kb}KB" if kb else f"{img.stat().st_size}B"
+        mtime = datetime.fromtimestamp(img.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        print(f"{i:<4} {img.name:<40} {size:<10} {mtime:<20}")
+    try:
+        choice = input(f"\nSelect image (1-{min(len(images), 10)}): ")
+        idx = int(choice) - 1
+        if 0 <= idx < len(images):
+            view_image(str(images[idx]), viewer)
+    except (ValueError, IndexError):
+        print("Invalid choice")
+
+
+def launch_browser(url, sid, browser="auto", use_tmux=False):
+    s = Session(sid)
+    if not s.exists():
+        print(f"Session '{sid}' not found")
+        return False
+
+    available = detect_browsers()
+    if not available:
+        print("No browser. Run: cinder install-deps")
+        return False
+
+    if browser == "auto":
+        browser = next((b for b in ("links2", "links", "w3m") if b in available), available[0])
+
+    env = os.environ.copy()
+    env["HOME"] = str(s.path)
+    mode = detect_display_mode()
+
+    cmd = [browser]
+
+    if browser in ("links2", "links"):
+        if mode in ("x11", "wayland", "fb"):
+            cmd.append("-g")
+            print(f"  Display: {mode} (graphical mode)")
+        else:
+            print("  Display: text mode (256 colors)")
+            cmd.extend(["-force-html", "-enable-javascript"])
+        cmd.extend(["-cookie-jar", str(s.cookie_path)])
+        cmd.extend(["-download-dir", str(s.download_dir)])
+    elif browser == "w3m":
+        cmd.extend(["-cookie", "-o", f"cookie_file={s.cookie_path}"])
+        env["W3M_HOME"] = str(s.path)
+
+    if url:
+        cmd.append(url)
+
+    s.update(url=url or "", last_active=int(time.time()))
+
+    try:
+        if use_tmux and shutil.which("tmux"):
+            ses_name = f"cinder-{sid[:8]}"
+            has = subprocess.run(["tmux", "has-session", "-t", ses_name], capture_output=True)
+            if has.returncode == 0:
+                subprocess.run(["tmux", "attach", "-t", ses_name])
+            else:
+                subprocess.run(["tmux", "new-session", "-d", "-s", ses_name] + cmd, env=env)
+                subprocess.run(["tmux", "attach", "-t", ses_name])
+        else:
+            subprocess.run(cmd, env=env)
+        s.update(last_active=int(time.time()))
+        return True
+    except FileNotFoundError:
+        print(f"Browser '{browser}' not found")
+        return False
+    except KeyboardInterrupt:
+        print("\nExited")
+        s.update(last_active=int(time.time()))
+        return True
+    except Exception as e:
+        print(f"Error: {e}")
+        return False
+
+
+def resolve_session(partial):
+    if not SESSIONS_DIR.is_dir():
+        return None
+    for s in os.listdir(str(SESSIONS_DIR)):
+        if s == partial or s.startswith(partial):
+            return s
+    return None
+
+
+def cmd_new(args):
+    sid = uuid.uuid4().hex[:16]
+    Session(sid).create(args.url or "", args.name or "")
+    print(f"Session: {sid[:8]} ({args.name or sid[:8]})")
+    launch_browser(args.url or "", sid, args.browser, args.tmux)
+
+
+def cmd_list(args):
+    if not SESSIONS_DIR.is_dir():
+        print("No sessions. Run: cinder new <url>")
+        return
+    sessions = sorted(SESSIONS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not sessions:
+        print("No sessions")
+        return
+    print(f"{'ID':<10} {'Name':<20} {'URL':<35} {'Created':<16}")
+    print("-" * 81)
+    for p in sessions:
+        s = Session(p.name)
+        if not s.exists():
+            continue
+        m = s.meta()
+        created = datetime.fromtimestamp(m.get("created", 0)).strftime("%m-%d %H:%M")
+        url = m.get("url", "")[:33]
+        name = m.get("name", p.name[:8])[:18]
+        print(f"{p.name[:8]:<10} {name:<20} {url:<35} {created:<16}")
+
+
+def cmd_attach(args):
+    sid = resolve_session(args.session_id)
+    if not sid:
+        print(f"Session '{args.session_id}' not found")
+        return
+    m = Session(sid).meta()
+    url = args.url or m.get("url", "")
+    print(f"Attaching to {sid[:8]}...")
+    launch_browser(url, sid, args.browser, args.tmux)
+
+
+def cmd_rm(args):
+    sid = resolve_session(args.session_id)
+    if not sid:
+        print(f"Session '{args.session_id}' not found")
+        return
+    confirm = input(f"Delete session {sid[:8]}? (y/N): ")
+    if confirm.lower() == "y":
+        Session(sid).delete()
+        print(f"Deleted {sid[:8]}")
+    else:
+        print("Cancelled")
+
+
+def cmd_img(args):
+    if args.url_or_path.startswith(("http://", "https://")):
+        view_image_url(args.url_or_path, args.viewer)
+    else:
+        view_image(args.url_or_path, args.viewer)
+
+
+def cmd_captcha(args):
+    sid = resolve_session(args.session_id)
+    if not sid:
+        print(f"Session '{args.session_id}' not found")
+        return
+    captcha_view(sid, args.viewer)
+
+
+def cmd_history(args):
+    sid = resolve_session(args.session_id)
+    if not sid:
+        print(f"Session '{args.session_id}' not found")
+        return
+    for e in reversed(Session(sid).history(args.limit)):
+        dt = datetime.fromtimestamp(e["time"]).strftime("%H:%M")
+        title = f" — {e['title']}" if e["title"] else ""
+        print(f"  [{dt}] {e['url']}{title}")
+
+
+def cmd_bookmarks(args):
+    sid = resolve_session(args.session_id)
+    if not sid:
+        print(f"Session '{args.session_id}' not found")
+        return
+    bms = Session(sid).bookmarks()
+    if not bms:
+        print("No bookmarks")
+        return
+    for i, b in enumerate(bms, 1):
+        title = f" ({b['title']})" if b["title"] else ""
+        print(f"  {i}. {b['url']}{title}")
+
+
+def cmd_info(args):
+    sid = resolve_session(args.session_id)
+    if not sid:
+        print(f"Session '{args.session_id}' not found")
+        return
+    s = Session(sid)
+    m = s.meta()
+    size = sum(f.stat().st_size for f in s.path.rglob("*") if f.is_file()) // 1024
+    print(f"ID:      {sid}")
+    print(f"Name:    {m.get('name', '—')}")
+    print(f"Created: {datetime.fromtimestamp(m['created']).strftime('%Y-%m-%d %H:%M')}")
+    print(f"Updated: {datetime.fromtimestamp(m['updated']).strftime('%Y-%m-%d %H:%M')}")
+    print(f"URL:     {m.get('url', '—')}")
+    print(f"Size:    {size}KB")
+    print(f"Cookies: {s.cookie_path.stat().st_size}B" if s.cookie_path.exists() else "Cookies: 0B")
+    print(f"History: {len(s.history())} entries")
+    print(f"Bookmarks: {len(s.bookmarks())} entries")
+    imgs = list(s.download_dir.glob("*.*"))
+    print(f"Images:  {len(imgs)}")
+
+
+def cmd_export(args):
+    sid = resolve_session(args.session_id)
+    if not sid:
+        print(f"Session '{args.session_id}' not found")
+        return
+    s = Session(sid)
+    out = Path(args.output) if args.output else Path.cwd() / f"cinder-{sid[:8]}"
+    out.mkdir(parents=True, exist_ok=True)
+    for item in s.path.iterdir():
+        if item.is_file():
+            shutil.copy2(item, out / item.name)
+    print(f"Exported to {out}")
+
+
+def cmd_clean(args):
+    if not SESSIONS_DIR.is_dir():
+        return
+    cutoff = time.time() - (args.days * 86400)
+    count = 0
+    for p in SESSIONS_DIR.iterdir():
+        if p.is_dir() and p.stat().st_mtime < cutoff:
+            shutil.rmtree(p, ignore_errors=True)
+            count += 1
+    print(f"Cleaned {count} session(s)")
+
+
+def cmd_config(args):
+    cfg = load_config()
+    if args.edit:
+        editor = os.environ.get("EDITOR", "vi")
+        subprocess.run([editor, str(CONFIG_PATH)])
+        return
+    print(json.dumps(cfg, indent=2))
+
+
+def cmd_install_deps(args):
+    pm = "pkg" if shutil.which("pkg") else "apt-get"
+    deps = ["links2", "w3m", "chafa", "catimg"]
+    print(f"Installing: {' '.join(deps)} via {pm}")
+    try:
+        subprocess.run([pm, "update", "-y"])
+        subprocess.run([pm, "install", "-y"] + deps)
+        print("Done!")
+    except Exception as e:
+        print(f"Failed: {e}")
+
+
+def main():
+    ensure_dirs()
+
+    parser = argparse.ArgumentParser(
+        prog="cinder",
+        description="Sandboxed terminal browser for Termux — isolated sessions with image support",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cinder new https://example.com     new session + browse
+  cinder new --tmux                  browse in tmux session
+  cinder list                        list all sessions
+  cinder attach abc123               re-open a session
+  cinder captcha abc123              view CAPTCHA images
+  cinder img https://site.com/a.png  view image in terminal
+  cinder install-deps                install browser/image deps
+  cinder clean                       remove old sessions
+""")
+
+    sub = parser.add_subparsers(dest="command")
+
+    def common(p):
+        p.add_argument("--browser", "-b", default="auto")
+        p.add_argument("--viewer", "-v", default="")
+        p.add_argument("--tmux", action="store_true")
+
+    p = sub.add_parser("new", help="Create session and browse")
+    p.add_argument("url", nargs="?", default="", help="URL to open")
+    p.add_argument("--name", "-n", default="")
+    common(p)
+    p.set_defaults(func=cmd_new)
+
+    sub.add_parser("list", aliases=["ls"], help="List sessions").set_defaults(func=cmd_list)
+
+    p = sub.add_parser("attach", help="Re-open a session")
+    p.add_argument("session_id")
+    p.add_argument("url", nargs="?", default="")
+    common(p)
+    p.set_defaults(func=cmd_attach)
+
+    p = sub.add_parser("rm", aliases=["delete"], help="Delete a session")
+    p.add_argument("session_id")
+    p.set_defaults(func=cmd_rm)
+
+    p = sub.add_parser("img", help="View an image in terminal")
+    p.add_argument("url_or_path")
+    p.add_argument("--viewer", "-v", default="")
+    p.set_defaults(func=cmd_img)
+
+    p = sub.add_parser("captcha", aliases=["cap"], help="View session images")
+    p.add_argument("session_id")
+    p.add_argument("--viewer", "-v", default="")
+    p.set_defaults(func=cmd_captcha)
+
+    p = sub.add_parser("history", aliases=["hist"], help="Show history")
+    p.add_argument("session_id")
+    p.add_argument("--limit", "-l", type=int, default=50)
+    p.set_defaults(func=cmd_history)
+
+    p = sub.add_parser("bookmarks", aliases=["bm"], help="Show bookmarks")
+    p.add_argument("session_id")
+    p.set_defaults(func=cmd_bookmarks)
+
+    p = sub.add_parser("info", help="Session details")
+    p.add_argument("session_id")
+    p.set_defaults(func=cmd_info)
+
+    p = sub.add_parser("export", help="Export session data")
+    p.add_argument("session_id")
+    p.add_argument("--output", "-o", default="")
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("clean", help="Remove old sessions")
+    p.add_argument("--days", "-d", type=int, default=14)
+    p.set_defaults(func=cmd_clean)
+
+    p = sub.add_parser("config", help="Show or edit config")
+    p.add_argument("--edit", "-e", action="store_true")
+    p.set_defaults(func=cmd_config)
+
+    sub.add_parser("install-deps", help="Install browser & image deps").set_defaults(func=cmd_install_deps)
+
+    args = parser.parse_args()
+    if args.command is None:
+        parser.print_help()
+        return
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
